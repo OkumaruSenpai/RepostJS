@@ -1,4 +1,4 @@
-// STINT0 - servidor sencillo para servir RAWs con API key
+// STINT0 - servidor sencillo para servir RAWs con API key (CJS)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -11,12 +11,22 @@ const API_KEY = process.env.API_KEY;
 const RAW_URL = process.env.RAW_URL; // raw fijo (Roblox)
 const BASE_REPO_URL = (process.env.BASE_REPO_URL || '').replace(/\/$/, '');
 const TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000);
+const MAX_CACHE_ENTRIES = Number(process.env.MAX_CACHE_ENTRIES || 500);
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 60_000);
 const ALLOWED_EXT = new Set(
   (process.env.ALLOWED_EXT || '.lua,.txt,.json')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean)
 );
+
+// Log de configuración (sin exponer secretos)
+console.log('Config:', {
+  has_API_KEY: !!API_KEY,
+  has_RAW_URL: !!RAW_URL,
+  has_BASE_REPO_URL: !!BASE_REPO_URL,
+  TTL_MS, MAX_CACHE_ENTRIES, CLEANUP_INTERVAL_MS, PORT
+});
 
 // --- Utilidades ---
 const VALID_NAME_RE = /^[a-zA-Z0-9._-]{1,128}$/;
@@ -34,11 +44,30 @@ function auth(req, res) {
 // Caché simple en memoria: url -> { data, contentType, expiresAt }
 const cache = new Map();
 
+function evictIfNeeded() {
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    const firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+  }
+}
+
+// Limpieza periódica de expirados para liberar memoria
+setInterval(() => {
+  const now = Date.now();
+  for (const [url, entry] of cache) {
+    if (entry.expiresAt <= now) cache.delete(url);
+  }
+}, CLEANUP_INTERVAL_MS).unref();
+
 async function fetchRaw(url) {
   const now = Date.now();
   const entry = cache.get(url);
-  if (entry && entry.expiresAt > now) {
-    return { data: entry.data, contentType: entry.contentType, fromCache: true };
+  if (entry) {
+    if (entry.expiresAt > now) {
+      return { data: entry.data, contentType: entry.contentType, fromCache: true };
+    } else {
+      cache.delete(url); // liberar expirado
+    }
   }
 
   const resp = await axios.get(url, {
@@ -50,6 +79,8 @@ async function fetchRaw(url) {
 
   const contentType = resp.headers['content-type'] || 'text/plain; charset=utf-8';
   cache.set(url, { data: resp.data, contentType, expiresAt: now + TTL_MS });
+  evictIfNeeded();
+
   return { data: resp.data, contentType, fromCache: false };
 }
 
@@ -98,10 +129,25 @@ app.get('/obtener-script/:archivo', async (req, res, next) => {
 
 // Manejo de errores
 app.use((err, _req, res, _next) => {
-  console.error('Error:', err?.message || err);
+  console.error('Error:', err?.stack || err?.message || err);
   res.status(502).send('Error al obtener el archivo.');
 });
 
-app.listen(PORT, () => {
-  console.log('STINT0 escuchando en el puerto', PORT);
+// Handlers globales para ver errores que matarían el proceso
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
 });
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  // Optional: process.exit(1);
+});
+
+// Listen en 0.0.0.0 (Railway)
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log('STINT0 escuchando en', server.address());
+});
+server.on('error', (err) => {
+  console.error('Error en listen:', err);
+});
+
+
